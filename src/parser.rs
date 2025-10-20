@@ -1,7 +1,7 @@
 use crate::ast::*;
 use crate::lexer::Lexer;
 use crate::token::Token;
-use crate::visitor::{ItemVisitor, SQLParser, StatementVisitor};
+use crate::visitor::Visitor;
 use std::mem;
 
 /// Main parser implementation.
@@ -227,7 +227,7 @@ impl Parser {
                 // The EXISTS SELECT ... without parentheses is not allowed.
                 self.next_token();
                 self.expect(Token::LParen)?;
-                let subquery = self.visit_select_statement()?;
+                let subquery = self.parse_select_statement()?;
                 self.expect(Token::RParen)?;
                 Ok(Expr::Exists(Box::new(subquery)))
             }
@@ -305,7 +305,7 @@ impl Parser {
                         self.expect(Token::LParen)?;
 
                         if self.current_token == Token::Select {
-                            let subquery = self.visit_select_statement()?;
+                            let subquery = self.parse_select_statement()?;
                             self.expect(Token::RParen)?;
                             return Ok(Expr::BinaryOp {
                                 left: Box::new(left),
@@ -363,7 +363,7 @@ impl Parser {
 
                 // Check if it's a subquery or a list
                 if self.current_token == Token::Select {
-                    let subquery = self.visit_select_statement()?;
+                    let subquery = self.parse_select_statement()?;
                     self.expect(Token::RParen)?;
                     return Ok(Expr::BinaryOp {
                         left: Box::new(left),
@@ -522,31 +522,31 @@ impl Parser {
     }
 }
 
-impl SQLParser for Parser {
-    fn parse(&mut self) -> Result<Statement, String> {
+impl Visitor for Parser {
+    fn visit(&mut self) -> Result<Statement, String> {
         match &self.current_token {
-            Token::With => Ok(Statement::With(self.visit_with_statement()?)),
-            Token::Select => Ok(Statement::Select(self.visit_select_statement()?)),
-            Token::Insert => Ok(Statement::Insert(self.visit_insert_statement()?)),
-            Token::Update => Ok(Statement::Update(self.visit_update_statement()?)),
-            Token::Delete => Ok(Statement::Delete(self.visit_delete_statement()?)),
+            Token::With => Ok(Statement::With(self.parse_with_statement()?)),
+            Token::Select => Ok(Statement::Select(self.parse_select_statement()?)),
+            Token::Insert => Ok(Statement::Insert(self.parse_insert_statement()?)),
+            Token::Update => Ok(Statement::Update(self.parse_update_statement()?)),
+            Token::Delete => Ok(Statement::Delete(self.parse_delete_statement()?)),
             Token::Create => {
                 let next_token = self.__peek_token();
                 match next_token {
                     Token::Table => {
-                        Ok(Statement::CreateTable(self.visit_create_table_statement()?))
+                        Ok(Statement::CreateTable(self.parse_create_table_statement()?))
                     }
                     Token::Index | Token::Unique => {
-                        Ok(Statement::CreateIndex(self.visit_create_index_statement()?))
+                        Ok(Statement::CreateIndex(self.parse_create_index_statement()?))
                     }
 
                     _ => Err(format!("Invalid token: {}", next_token).to_string()),
                 }
             }
-            Token::Alter => Ok(Statement::AlterTable(self.visit_alter_statement()?)),
-            Token::Drop => Ok(Statement::DropTable(self.visit_drop_statement()?)),
+            Token::Alter => Ok(Statement::AlterTable(self.parse_alter_statement()?)),
+            Token::Drop => Ok(Statement::DropTable(self.parse_drop_statement()?)),
             Token::Begin | Token::Commit | Token::Rollback => {
-                Ok(Statement::Transaction(self.visit_transaction_statement()?))
+                Ok(Statement::Transaction(self.parse_transaction_statement()?))
             }
             _ => Err(format!(
                 "Unexpected statement type: {:?}",
@@ -556,7 +556,7 @@ impl SQLParser for Parser {
     }
 }
 
-impl StatementVisitor for Parser {
+impl Parser {
     /// Visits an ALTER TABLE statement.
     ///
     /// ```sql
@@ -567,7 +567,7 @@ impl StatementVisitor for Parser {
     /// ALTER TABLE [table] ALTER COLUMN
     /// [...]
     /// ```
-    fn visit_alter_statement(&mut self) -> Result<AlterTableStatement, String> {
+    fn parse_alter_statement(&mut self) -> Result<AlterTableStatement, String> {
         self.expect(Token::Alter)?;
         self.expect(Token::Table)?;
 
@@ -585,11 +585,11 @@ impl StatementVisitor for Parser {
             if self.consume_if(&Token::Column) || matches!(self.current_token, Token::Identifier(_))
             {
                 // Add column action requires a column definition
-                let column_def = self.visit_column_def()?;
+                let column_def = self.parse_column_def()?;
                 AlterAction::AddColumn(column_def)
             } else if self.consume_if(&Token::Constraint) {
                 // Add constraint action requires a constraint definition.
-                let constraint = self.visit_table_constraint()?;
+                let constraint = self.parse_table_constraint()?;
                 AlterAction::AddConstraint(constraint)
             } else {
                 return Err("Expected COLUMN or CONSTRAINT after ADD".to_string());
@@ -655,7 +655,7 @@ impl StatementVisitor for Parser {
                     }
                 } else {
                     // Assume it's a type change
-                    let data_type = self.visit_data_type()?;
+                    let data_type = self.parse_data_type()?;
                     AlterColumnAction::SetDataType(data_type)
                 };
 
@@ -678,7 +678,7 @@ impl StatementVisitor for Parser {
     ///    [...]
     /// );",
     ///```
-    fn visit_create_table_statement(&mut self) -> Result<CreateTableStatement, String> {
+    fn parse_create_table_statement(&mut self) -> Result<CreateTableStatement, String> {
         self.expect(Token::Create)?;
         self.expect(Token::Table)?;
         let table = if let Token::Identifier(name) = &self.current_token {
@@ -700,12 +700,12 @@ impl StatementVisitor for Parser {
                 self.current_token,
                 Token::Primary | Token::Unique | Token::Foreign | Token::Check | Token::Constraint
             ) {
-                constraints.push(self.visit_table_constraint()?);
+                constraints.push(self.parse_table_constraint()?);
             } else if let Token::Identifier(name) = &self.current_token {
                 let col_name = name.clone();
                 self.next_token();
-                let data_type = self.visit_data_type()?;
-                let col_constraints = self.visit_column_constraints()?;
+                let data_type = self.parse_data_type()?;
+                let col_constraints = self.parse_column_constraints()?;
 
                 columns.push(ColumnDef {
                     name: col_name,
@@ -730,7 +730,7 @@ impl StatementVisitor for Parser {
         })
     }
 
-    fn visit_create_index_statement(&mut self) -> Result<CreateIndexStatement, String> {
+    fn parse_create_index_statement(&mut self) -> Result<CreateIndexStatement, String> {
         self.expect(Token::Create)?;
 
         let unique = self.consume_if(&Token::Unique);
@@ -806,7 +806,7 @@ impl StatementVisitor for Parser {
     /// WHERE [expr]
     /// [...]
     /// ```
-    fn visit_delete_statement(&mut self) -> Result<DeleteStatement, String> {
+    fn parse_delete_statement(&mut self) -> Result<DeleteStatement, String> {
         self.expect(Token::Delete)?;
         self.expect(Token::From)?;
 
@@ -835,7 +835,7 @@ impl StatementVisitor for Parser {
     /// ```sql
     /// DROP TABLE [table]
     /// ```
-    fn visit_drop_statement(&mut self) -> Result<DropTableStatement, String> {
+    fn parse_drop_statement(&mut self) -> Result<DropTableStatement, String> {
         self.expect(Token::Drop)?;
         self.expect(Token::Table)?;
 
@@ -901,7 +901,7 @@ impl StatementVisitor for Parser {
     /// INSERT INTO [table] (col1, col2, col3)
     /// SELECT FROM [other table];
     /// ```
-    fn visit_insert_statement(&mut self) -> Result<InsertStatement, String> {
+    fn parse_insert_statement(&mut self) -> Result<InsertStatement, String> {
         self.expect(Token::Insert)?;
         self.expect(Token::Into)?;
 
@@ -955,7 +955,7 @@ impl StatementVisitor for Parser {
             }
             Values::Values(value_lists)
         } else if self.current_token == Token::Select {
-            Values::Query(Box::new(self.visit_select_statement()?))
+            Values::Query(Box::new(self.parse_select_statement()?))
         } else {
             return Err("Expected VALUES or SELECT".to_string());
         };
@@ -975,7 +975,7 @@ impl StatementVisitor for Parser {
     /// ROLLBACK
     /// END TRANSACTION
     /// ```
-    fn visit_transaction_statement(&mut self) -> Result<TransactionStatement, String> {
+    fn parse_transaction_statement(&mut self) -> Result<TransactionStatement, String> {
         match &self.current_token {
             Token::Begin => {
                 self.next_token();
@@ -1002,7 +1002,7 @@ impl StatementVisitor for Parser {
     /// WHERE [expr]
     /// [...]
     /// ```
-    fn visit_update_statement(&mut self) -> Result<UpdateStatement, String> {
+    fn parse_update_statement(&mut self) -> Result<UpdateStatement, String> {
         self.expect(Token::Update)?;
 
         let table = if let Token::Identifier(name) = &self.current_token {
@@ -1053,7 +1053,7 @@ impl StatementVisitor for Parser {
     /// ([CTE])
     ///[...] (Supports up to N ctes)
     /// SELECT [...]
-    fn visit_with_statement(&mut self) -> Result<WithStatement, String> {
+    fn parse_with_statement(&mut self) -> Result<WithStatement, String> {
         self.expect(Token::With)?;
         let recursive = if matches!(self.current_token, Token::Recursive) {
             self.next_token();
@@ -1075,7 +1075,7 @@ impl StatementVisitor for Parser {
 
             self.expect(Token::As)?;
             self.expect(Token::LParen)?;
-            let select_stmt = self.visit_select_statement()?;
+            let select_stmt = self.parse_select_statement()?;
             self.expect(Token::RParen)?;
 
             ctes.push((name, select_stmt));
@@ -1085,7 +1085,7 @@ impl StatementVisitor for Parser {
             }
         }
 
-        let body = Box::new(self.visit_select_statement()?);
+        let body = Box::new(self.parse_select_statement()?);
 
         Ok(WithStatement {
             recursive,
@@ -1104,17 +1104,17 @@ impl StatementVisitor for Parser {
     /// ORDER BY [item] [ASC/DESC]
     /// LIMIT n;
     /// ```
-    fn visit_select_statement(&mut self) -> Result<SelectStatement, String> {
+    fn parse_select_statement(&mut self) -> Result<SelectStatement, String> {
         self.expect(Token::Select)?;
 
         let distinct = self.consume_if(&Token::Distinct);
 
         // Parse SELECT list
-        let columns = self.visit_select_list()?;
+        let columns = self.parse_select_list()?;
 
         // Parse FROM clause
         let from = if self.consume_if(&Token::From) {
-            Some(self.visit_table_ref()?)
+            Some(self.parse_table_ref()?)
         } else {
             None
         };
@@ -1188,10 +1188,8 @@ impl StatementVisitor for Parser {
             limit,
         })
     }
-}
 
-impl ItemVisitor for Parser {
-    fn visit_select_list(&mut self) -> Result<Vec<SelectItem>, String> {
+    fn parse_select_list(&mut self) -> Result<Vec<SelectItem>, String> {
         let mut items = Vec::new();
 
         loop {
@@ -1242,7 +1240,7 @@ impl ItemVisitor for Parser {
     /// [...]
     /// JOIN tablen ON .[..]
     /// ```
-    fn visit_table_ref(&mut self) -> Result<TableReference, String> {
+    fn parse_table_ref(&mut self) -> Result<TableReference, String> {
         let mut table_ref = match &self.current_token {
             Token::Identifier(name) => {
                 let table_name = name.clone();
@@ -1262,7 +1260,7 @@ impl ItemVisitor for Parser {
             Token::LParen => {
                 // Subquery in FROM
                 self.next_token();
-                let subquery = self.visit_select_statement()?;
+                let subquery = self.parse_select_statement()?;
                 self.expect(Token::RParen)?;
 
                 if let Token::As = &self.current_token {
@@ -1326,7 +1324,7 @@ impl ItemVisitor for Parser {
             };
 
             // Parse the right-hand side of the join
-            let right = self.visit_table_ref()?;
+            let right = self.parse_table_ref()?;
 
             // Optional ON clause
             let on = if self.consume_if(&Token::On) {
@@ -1349,7 +1347,7 @@ impl ItemVisitor for Parser {
     /// Parses data types.
     ///
     /// Supports both SQL standard data types and RQLite specific types (VARINT, BLOB and TEXT).
-    fn visit_data_type(&mut self) -> Result<DataType, String> {
+    fn parse_data_type(&mut self) -> Result<DataType, String> {
         let data_type = if let Token::Identifier(type_name) = &self.current_token {
             let name = type_name.to_uppercase();
             self.next_token();
@@ -1451,7 +1449,7 @@ impl ItemVisitor for Parser {
 
     /// Parses a column definition statement.
     /// [COL_NAME] [DATA TYPE] [CONSTRAINTS]
-    fn visit_column_def(&mut self) -> Result<ColumnDef, String> {
+    fn parse_column_def(&mut self) -> Result<ColumnDef, String> {
         let name = if let Token::Identifier(col_name) = &self.current_token {
             let name = col_name.clone();
             self.next_token();
@@ -1460,8 +1458,8 @@ impl ItemVisitor for Parser {
             return Err("Expected column name".to_string());
         };
 
-        let data_type = self.visit_data_type()?;
-        let constraints = self.visit_column_constraints()?;
+        let data_type = self.parse_data_type()?;
+        let constraints = self.parse_column_constraints()?;
 
         Ok(ColumnDef {
             name,
@@ -1479,7 +1477,7 @@ impl ItemVisitor for Parser {
     /// - Primary and Foriegn Keys,
     /// - Check Constraints,
     /// - Default Constraints.
-    fn visit_column_constraints(&mut self) -> Result<Vec<ColumnConstraint>, String> {
+    fn parse_column_constraints(&mut self) -> Result<Vec<ColumnConstraint>, String> {
         let mut constraints = Vec::new();
 
         loop {
@@ -1553,7 +1551,7 @@ impl ItemVisitor for Parser {
     /// ```sql
     /// ALTER TABLE foo ADD CONSTRAINT [body];
     /// ```
-    fn visit_table_constraint(&mut self) -> Result<TableConstraint, String> {
+    fn parse_table_constraint(&mut self) -> Result<TableConstraint, String> {
         // Skip optional CONSTRAINT name
         if self.consume_if(&Token::Constraint)
             && let Token::Identifier(_) = self.current_token

@@ -1234,8 +1234,6 @@ sql_test!(
     })
 );
 
-
-
 sql_test!(
     test_select_like,
     "SELECT * FROM table1 WHERE Value LIKE '%hello%';",

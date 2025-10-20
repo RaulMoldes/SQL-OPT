@@ -4,23 +4,36 @@ mod parser;
 #[cfg(test)]
 mod tests;
 mod token;
+//mod optimizer;
+mod simplify;
 mod visitor;
-
 use ast::*;
 use lexer::Lexer;
 use parser::Parser;
-use visitor::SQLParser;
-
-
+use visitor::Visitor;
+use simplify::Simplify;
 use colored::*;
-use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
+use rustyline::error::ReadlineError;
+
+use crate::simplify::Simplifyer;
 
 /// Parse a SQL query string into an AST
 pub(crate) fn parse_sql(sql: &str) -> Result<Statement, String> {
     let lexer = Lexer::new(sql);
     let mut parser = Parser::new(lexer);
-    parser.parse()
+    parser.visit()
+
+}
+
+
+/// Simplify a SQL query string into an optimized AST
+pub(crate) fn simplify_sql(sql: &str) -> Result<Statement, String> {
+    let lexer = Lexer::new(sql);
+    let parser = Parser::new(lexer);
+    let mut simplifier = Simplifyer::new(parser);
+    simplifier.visit()
+
 }
 
 fn main() {
@@ -42,11 +55,11 @@ fn main() {
                 if line == ".help" {
                     println!(
                         "{}",
-                        "Commands:\n  .help  - Show this message\n  .exit  - Quit the shell\n".bright_black()
+                        "Commands:\n  .help  - Show this message\n  .exit  - Quit the shell\n"
+                            .bright_black()
                     );
                     continue;
                 }
-
 
                 while !line.trim_end().ends_with(';') {
                     let more = rl.readline("...> ");
@@ -62,13 +75,10 @@ fn main() {
 
                 rl.add_history_entry(line.clone()).ok();
 
-                match parse_sql(&line) {
+                match simplify_sql(&line) {
                     Ok(ast) => {
-                        println!(
-                            "{}\n{:#?}\n",
-                            "Successfully parsed:".green().bold(),
-                            ast
-                        );
+
+                        println!("{}\n{:#?}\n", "Successfully parsed:".green().bold(), ast);
                     }
                     Err(err) => {
                         eprintln!("{} {}", "Parse error:".red().bold(), err);
