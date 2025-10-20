@@ -57,12 +57,6 @@ pub(crate) enum Expr {
 
     // EXISTS
     Exists(Box<SelectStatement>),
-
-    // Type cast
-    Cast {
-        expr: Box<Expr>,
-        data_type: String,
-    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -128,7 +122,6 @@ pub(crate) struct SelectStatement {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum SelectItem {
     Star,
-    QualifiedStar(String),
     ExprWithAlias { expr: Expr, alias: Option<String> },
 }
 
@@ -181,6 +174,7 @@ pub(crate) enum Statement {
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct WithStatement {
+    pub(crate) recursive: bool,
     pub(crate) ctes: Vec<(String, SelectStatement)>,
     pub(crate) body: Box<SelectStatement>,
 }
@@ -236,6 +230,7 @@ pub(crate) enum DataType {
     Integer,
     BigInt,
     SmallInt,
+    VarInt,
     Decimal(Option<u8>, Option<u8>),
     Numeric(Option<u8>, Option<u8>),
     Real,
@@ -250,6 +245,7 @@ pub(crate) enum DataType {
     Json,
     Jsonb,
     Uuid,
+    Blob,
     Custom(String),
 }
 
@@ -282,13 +278,16 @@ pub(crate) struct AlterTableStatement {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub(crate) struct AlterColumnStatement {
+    pub(crate) name: String,
+    pub(crate) action: AlterColumnAction,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) enum AlterAction {
     AddColumn(ColumnDef),
     DropColumn(String),
-    AlterColumn {
-        name: String,
-        action: AlterColumnAction,
-    },
+    AlterColumn(AlterColumnStatement),
     AddConstraint(TableConstraint),
     DropConstraint(String),
 }

@@ -274,7 +274,7 @@ impl Lexer {
     }
 
     /// Peek the next token, without advancing the cursor.
-    pub(crate) fn peek_token(&mut self) -> Token {
+    pub(crate) fn __peek_token(&mut self) -> Token {
         let saved_position = self.position;
         let saved_char = self.current_char;
 

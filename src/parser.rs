@@ -1,6 +1,7 @@
 use crate::ast::*;
 use crate::lexer::Lexer;
 use crate::token::Token;
+use crate::visitor::{ItemVisitor, SQLParser, StatementVisitor};
 use std::mem;
 
 /// Main parser implementation.
@@ -23,8 +24,8 @@ impl Parser {
         self.current_token = self.lexer.next_token();
     }
 
-    fn peek_token(&mut self) -> Token {
-        self.lexer.peek_token()
+    fn __peek_token(&mut self) -> Token {
+        self.lexer.__peek_token()
     }
 
     fn expect(&mut self, expected: Token) -> Result<(), String> {
@@ -190,11 +191,19 @@ impl Parser {
             }
             Token::Minus => {
                 self.next_token();
-                let expr = self.parse_expr_bp(9)?; // Unary minus precedence
-                Ok(Expr::UnaryOp {
-                    op: UnaryOperator::Minus,
-                    expr: Box::new(expr),
-                })
+                // Special case: if next token is a number, combine into negative number
+                if let Token::NumberLiteral(n) = self.current_token {
+                    let num = -n;
+                    self.next_token();
+                    Ok(Expr::Number(num))
+                } else {
+                    // Regular unary minus for expressions
+                    let expr = self.parse_expr_bp(9)?;
+                    Ok(Expr::UnaryOp {
+                        op: UnaryOperator::Minus,
+                        expr: Box::new(expr),
+                    })
+                }
             }
             // If you take a look at the infix table:
             // ´´´rust
@@ -218,7 +227,7 @@ impl Parser {
                 // The EXISTS SELECT ... without parentheses is not allowed.
                 self.next_token();
                 self.expect(Token::LParen)?;
-                let subquery = self.parse_select_statement()?;
+                let subquery = self.visit_select_statement()?;
                 self.expect(Token::RParen)?;
                 Ok(Expr::Exists(Box::new(subquery)))
             }
@@ -287,13 +296,74 @@ impl Parser {
                 self.next_token();
                 BinaryOperator::Like
             }
+            Token::Not => {
+                // Handle combined infix forms: NOT IN / NOT BETWEEN / NOT LIKE
+                self.next_token(); // consume NOT
+                match &self.current_token {
+                    Token::In => {
+                        self.next_token();
+                        self.expect(Token::LParen)?;
+
+                        if self.current_token == Token::Select {
+                            let subquery = self.visit_select_statement()?;
+                            self.expect(Token::RParen)?;
+                            return Ok(Expr::BinaryOp {
+                                left: Box::new(left),
+                                op: BinaryOperator::NotIn,
+                                right: Box::new(Expr::Subquery(Box::new(subquery))),
+                            });
+                        } else {
+                            let mut values = Vec::new();
+                            loop {
+                                values.push(self.parse_expression()?);
+                                if !self.consume_if(&Token::Comma) {
+                                    break;
+                                }
+                            }
+                            self.expect(Token::RParen)?;
+                            return Ok(Expr::BinaryOp {
+                                left: Box::new(left),
+                                op: BinaryOperator::NotIn,
+                                right: Box::new(Expr::List(values)),
+                            });
+                        }
+                    }
+                    Token::Between => {
+                        self.next_token();
+                        let low = self.parse_expr_bp(4)?;
+                        self.expect(Token::And)?;
+                        let high = self.parse_expr_bp(4)?;
+                        return Ok(Expr::Between {
+                            expr: Box::new(left),
+                            negated: true,
+                            low: Box::new(low),
+                            high: Box::new(high),
+                        });
+                    }
+                    Token::Like => {
+                        self.next_token();
+                        let right = self.parse_expr_bp(r_bp)?;
+                        return Ok(Expr::BinaryOp {
+                            left: Box::new(left),
+                            op: BinaryOperator::NotLike,
+                            right: Box::new(right),
+                        });
+                    }
+                    _ => {
+                        return Err(format!(
+                            "Unexpected token after NOT in infix position: {:?}",
+                            self.current_token
+                        ));
+                    }
+                }
+            }
             Token::In => {
                 self.next_token();
                 self.expect(Token::LParen)?;
 
                 // Check if it's a subquery or a list
                 if self.current_token == Token::Select {
-                    let subquery = self.parse_select_statement()?;
+                    let subquery = self.visit_select_statement()?;
                     self.expect(Token::RParen)?;
                     return Ok(Expr::BinaryOp {
                         left: Box::new(left),
@@ -318,9 +388,9 @@ impl Parser {
             }
             Token::Between => {
                 self.next_token();
-                let low = self.parse_expression()?;
+                let low = self.parse_expr_bp(4)?;
                 self.expect(Token::And)?;
-                let high = self.parse_expression()?;
+                let high = self.parse_expr_bp(4)?;
                 return Ok(Expr::Between {
                     expr: Box::new(left),
                     negated: false,
@@ -364,7 +434,7 @@ impl Parser {
     // By assigning higher binding power to * than +, the parser knows:
     // + has lbp of 7 and * has lbp of 9. Therefore, the expression is interpreted as follows: (+ 1 (* 2 3)).
     // The operand 2 binds to the operator * as it has higher lbp than +'s rbp.
-    fn infix_binding_power(&self) -> Option<(u8, u8)> {
+    fn infix_binding_power(&mut self) -> Option<(u8, u8)> {
         match &self.current_token {
             Token::Or => Some((1, 2)),
             Token::And => Some((3, 4)),
@@ -374,10 +444,20 @@ impl Parser {
             Token::Plus | Token::Minus => Some((7, 8)),
             Token::Star | Token::Slash | Token::Percent => Some((9, 10)),
             Token::Concat => Some((7, 8)),
+            Token::Not => {
+                let next = self.__peek_token();
+                match next {
+                    Token::In | Token::Between | Token::Like => Some((5, 6)),
+                    _ => None,
+                }
+            }
             _ => None,
         }
     }
+}
 
+/// Utilities for parsing complex expressions.
+impl Parser {
     /// Parses a CASE expression.
     /// ```sql
     /// CASE enum
@@ -421,32 +501,620 @@ impl Parser {
         })
     }
 
-    /// Parses a SELECT expression.
+    /// Parses a list of identifier tokens: (col1, col2, col3 ...).
+    fn parse_identifier_list(&mut self) -> Result<Vec<String>, String> {
+        let mut identifiers = Vec::new();
+
+        loop {
+            if let Token::Identifier(name) = &self.current_token {
+                identifiers.push(name.clone());
+                self.next_token();
+            } else {
+                return Err("Expected identifier".to_string());
+            }
+
+            if !self.consume_if(&Token::Comma) {
+                break;
+            }
+        }
+
+        Ok(identifiers)
+    }
+}
+
+impl SQLParser for Parser {
+    fn parse(&mut self) -> Result<Statement, String> {
+        match &self.current_token {
+            Token::With => Ok(Statement::With(self.visit_with_statement()?)),
+            Token::Select => Ok(Statement::Select(self.visit_select_statement()?)),
+            Token::Insert => Ok(Statement::Insert(self.visit_insert_statement()?)),
+            Token::Update => Ok(Statement::Update(self.visit_update_statement()?)),
+            Token::Delete => Ok(Statement::Delete(self.visit_delete_statement()?)),
+            Token::Create => {
+                let next_token = self.__peek_token();
+                match next_token {
+                    Token::Table => {
+                        Ok(Statement::CreateTable(self.visit_create_table_statement()?))
+                    }
+                    Token::Index | Token::Unique => {
+                        Ok(Statement::CreateIndex(self.visit_create_index_statement()?))
+                    }
+
+                    _ => Err(format!("Invalid token: {}", next_token).to_string()),
+                }
+            }
+            Token::Alter => Ok(Statement::AlterTable(self.visit_alter_statement()?)),
+            Token::Drop => Ok(Statement::DropTable(self.visit_drop_statement()?)),
+            Token::Begin | Token::Commit | Token::Rollback => {
+                Ok(Statement::Transaction(self.visit_transaction_statement()?))
+            }
+            _ => Err(format!(
+                "Unexpected statement type: {:?}",
+                self.current_token
+            )),
+        }
+    }
+}
+
+impl StatementVisitor for Parser {
+    /// Visits an ALTER TABLE statement.
+    ///
     /// ```sql
-    /// SELECT  (c1, c2, c3, ...)
-    /// FROM [table_xpression]
-    /// WHERE
-    /// [condition]
-    /// GROUP BY
-    /// [expression]
-    /// HAVING
-    /// [condition]
-    /// ORDER BY
-    /// (col1, col2 , ...) [ASC/DESC]
-    /// LIMIT
-    /// [number]
-    /// ``
-    pub(crate) fn parse_select_statement(&mut self) -> Result<SelectStatement, String> {
+    /// ALTER TABLE [table] ADD COLUMN
+    /// ALTER TABLE [table] ADD CONSTRAINT
+    /// ALTER TABLE [table] DROP CONSTRAINT
+    /// ALTER TABLE [table] DROP COLUMN
+    /// ALTER TABLE [table] ALTER COLUMN
+    /// [...]
+    /// ```
+    fn visit_alter_statement(&mut self) -> Result<AlterTableStatement, String> {
+        self.expect(Token::Alter)?;
+        self.expect(Token::Table)?;
+
+        // Parse the table name as an identifier.
+        let table = if let Token::Identifier(name) = &self.current_token {
+            let table_name = name.clone();
+            self.next_token();
+            table_name
+        } else {
+            return Err("Expected table name".to_string());
+        };
+
+        let action = if self.consume_if(&Token::Add) {
+            // Allows both ADD COLUMN and ADD (column identifier) to generate ADD COLUMN statements.
+            if self.consume_if(&Token::Column) || matches!(self.current_token, Token::Identifier(_))
+            {
+                // Add column action requires a column definition
+                let column_def = self.visit_column_def()?;
+                AlterAction::AddColumn(column_def)
+            } else if self.consume_if(&Token::Constraint) {
+                // Add constraint action requires a constraint definition.
+                let constraint = self.visit_table_constraint()?;
+                AlterAction::AddConstraint(constraint)
+            } else {
+                return Err("Expected COLUMN or CONSTRAINT after ADD".to_string());
+            }
+
+        // Drop alter statements
+        } else if self.consume_if(&Token::Drop) {
+            // Drop column
+            if self.consume_if(&Token::Column) {
+                if let Token::Identifier(col_name) = &self.current_token {
+                    let name = col_name.clone();
+                    self.next_token();
+                    AlterAction::DropColumn(name)
+                } else {
+                    return Err("Expected column name".to_string());
+                }
+
+            // Drop constraint
+            } else if self.consume_if(&Token::Constraint) {
+                if let Token::Identifier(constraint_name) = &self.current_token {
+                    let name = constraint_name.clone();
+                    self.next_token();
+                    AlterAction::DropConstraint(name)
+                } else {
+                    return Err("Expected constraint name".to_string());
+                }
+            } else {
+                return Err("Expected COLUMN or CONSTRAINT after DROP".to_string());
+            }
+
+        // Alter statements to modify a column.
+        // Supported ones are:
+        //
+        // ALTER COLUMN SET DEFAULT [VALUE]
+        // ALTER COLUMN SET NOT NULL
+        // ALTER COLUMN DROP DEFAULT
+        // ALTER COLUMN DROP NOT NULL
+        // ALTER COLUMN SET [DATATYPE]
+        } else if self.consume_if(&Token::Alter) || self.consume_if(&Token::Modify) {
+            self.consume_if(&Token::Column);
+            if let Token::Identifier(col_name) = &self.current_token {
+                let name = col_name.clone();
+                self.next_token();
+
+                let action = if self.consume_if(&Token::Set) {
+                    if self.consume_if(&Token::Default) {
+                        let expr = self.parse_expression()?;
+                        AlterColumnAction::SetDefault(expr)
+                    } else if self.consume_if(&Token::Not) {
+                        self.expect(Token::Null)?;
+                        AlterColumnAction::SetNotNull
+                    } else {
+                        return Err("Expected DEFAULT or NOT NULL after SET".to_string());
+                    }
+                } else if self.consume_if(&Token::Drop) {
+                    if self.consume_if(&Token::Default) {
+                        AlterColumnAction::DropDefault
+                    } else if self.consume_if(&Token::Not) {
+                        self.expect(Token::Null)?;
+                        AlterColumnAction::DropNotNull
+                    } else {
+                        return Err("Expected DEFAULT or NOT NULL after DROP".to_string());
+                    }
+                } else {
+                    // Assume it's a type change
+                    let data_type = self.visit_data_type()?;
+                    AlterColumnAction::SetDataType(data_type)
+                };
+
+                AlterAction::AlterColumn(AlterColumnStatement { name, action })
+            } else {
+                return Err("Expected column name".to_string());
+            }
+        } else {
+            return Err("Expected ADD, DROP, ALTER, or MODIFY".to_string());
+        };
+
+        Ok(AlterTableStatement { table, action })
+    }
+
+    /// Parses a [CREATE TABLE] statement.
+    /// ```sql
+    /// CREATE TABLE [table] (
+    ///    col_1 [Dtype] [CONSTRAINT],
+    ///    col_2 [Dtype],
+    ///    [...]
+    /// );",
+    ///```
+    fn visit_create_table_statement(&mut self) -> Result<CreateTableStatement, String> {
+        self.expect(Token::Create)?;
+        self.expect(Token::Table)?;
+        let table = if let Token::Identifier(name) = &self.current_token {
+            let table_name = name.clone();
+            self.next_token();
+            table_name
+        } else {
+            return Err("Expected table name".to_string());
+        };
+
+        self.expect(Token::LParen)?;
+
+        let mut columns = Vec::new();
+        let mut constraints = Vec::new();
+
+        loop {
+            // Check if it's a table constraint
+            if matches!(
+                self.current_token,
+                Token::Primary | Token::Unique | Token::Foreign | Token::Check | Token::Constraint
+            ) {
+                constraints.push(self.visit_table_constraint()?);
+            } else if let Token::Identifier(name) = &self.current_token {
+                let col_name = name.clone();
+                self.next_token();
+                let data_type = self.visit_data_type()?;
+                let col_constraints = self.visit_column_constraints()?;
+
+                columns.push(ColumnDef {
+                    name: col_name,
+                    data_type,
+                    constraints: col_constraints,
+                });
+            } else {
+                return Err("Expected column definition or constraint".to_string());
+            }
+
+            if !self.consume_if(&Token::Comma) {
+                break;
+            }
+        }
+
+        self.expect(Token::RParen)?;
+
+        Ok(CreateTableStatement {
+            table,
+            columns,
+            constraints,
+        })
+    }
+
+    fn visit_create_index_statement(&mut self) -> Result<CreateIndexStatement, String> {
+        self.expect(Token::Create)?;
+
+        let unique = self.consume_if(&Token::Unique);
+        self.expect(Token::Index)?;
+        let if_not_exists = if self.current_token == Token::Identifier("if".to_string()) {
+            self.next_token();
+            self.expect(Token::Not)?;
+            self.expect(Token::Identifier("exists".to_string()))?;
+            true
+        } else {
+            false
+        };
+
+        let name = if let Token::Identifier(idx_name) = &self.current_token {
+            let index_name = idx_name.clone();
+            self.next_token();
+            index_name
+        } else {
+            return Err("Expected index name".to_string());
+        };
+
+        self.expect(Token::On)?;
+
+        let table = if let Token::Identifier(tbl_name) = &self.current_token {
+            let table_name = tbl_name.clone();
+            self.next_token();
+            table_name
+        } else {
+            return Err("Expected table name".to_string());
+        };
+
+        self.expect(Token::LParen)?;
+
+        let mut columns = Vec::new();
+        loop {
+            if let Token::Identifier(col_name) = &self.current_token {
+                let name = col_name.clone();
+                self.next_token();
+
+                let order = if self.consume_if(&Token::Asc) {
+                    Some(OrderDirection::Asc)
+                } else if self.consume_if(&Token::Desc) {
+                    Some(OrderDirection::Desc)
+                } else {
+                    None
+                };
+
+                columns.push(IndexColumn { name, order });
+            } else {
+                return Err("Expected column name".to_string());
+            }
+
+            if !self.consume_if(&Token::Comma) {
+                break;
+            }
+        }
+
+        self.expect(Token::RParen)?;
+
+        Ok(CreateIndexStatement {
+            name,
+            table,
+            columns,
+            unique,
+            if_not_exists,
+        })
+    }
+
+    /// Parses an DELETE statement, with multiple optional where clauses.
+    ///
+    /// ```sql
+    /// DELETE FROM [table]
+    /// WHERE [expr]
+    /// [...]
+    /// ```
+    fn visit_delete_statement(&mut self) -> Result<DeleteStatement, String> {
+        self.expect(Token::Delete)?;
+        self.expect(Token::From)?;
+
+        let table = if let Token::Identifier(name) = &self.current_token {
+            let table_name = name.clone();
+            self.next_token();
+            table_name
+        } else {
+            return Err("Expected table name".to_string());
+        };
+
+        let where_clause = if self.consume_if(&Token::Where) {
+            Some(self.parse_expression()?)
+        } else {
+            None
+        };
+
+        Ok(DeleteStatement {
+            table,
+            where_clause,
+        })
+    }
+
+    /// Parses (visits) a DROP TABLE statement
+    ///
+    /// ```sql
+    /// DROP TABLE [table]
+    /// ```
+    fn visit_drop_statement(&mut self) -> Result<DropTableStatement, String> {
+        self.expect(Token::Drop)?;
+        self.expect(Token::Table)?;
+
+        // Check for IF EXISTS clause
+        let if_exists = if let Token::Identifier(s) = &self.current_token {
+            if s.to_lowercase() == "if" {
+                self.next_token();
+                if let Token::Identifier(s2) = &self.current_token {
+                    if s2.to_lowercase() == "exists" {
+                        self.next_token();
+                        true
+                    } else {
+                        return Err("Expected EXISTS after IF".to_string());
+                    }
+                } else if self.current_token == Token::Exists {
+                    self.next_token();
+                    true
+                } else {
+                    return Err("Expected EXISTS after IF".to_string());
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        let table = if let Token::Identifier(name) = &self.current_token {
+            let table_name = name.clone();
+            self.next_token();
+            table_name
+        } else {
+            return Err("Expected table name".to_string());
+        };
+
+        let cascade = if let Token::Identifier(s) = &self.current_token {
+            if s.to_lowercase() == "cascade" {
+                self.next_token();
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        Ok(DropTableStatement {
+            table,
+            if_exists,
+            cascade,
+        })
+    }
+
+    /// Parses an [INSERT] statement.
+    ///  An insert statement consists of the list of columns to insert and an  optional values or query clause
+    /// Example with values:
+    /// ```sql
+    /// INSERT INTO [table] (col1, col2, col3)
+    /// VALUES ((value11, value12, value13), (value21, value22, value23));
+    /// ```
+    /// Example with query:
+    /// ```sql
+    /// INSERT INTO [table] (col1, col2, col3)
+    /// SELECT FROM [other table];
+    /// ```
+    fn visit_insert_statement(&mut self) -> Result<InsertStatement, String> {
+        self.expect(Token::Insert)?;
+        self.expect(Token::Into)?;
+
+        let table = if let Token::Identifier(name) = &self.current_token {
+            let table_name = name.clone();
+            self.next_token();
+            table_name
+        } else {
+            return Err("Expected table name".to_string());
+        };
+
+        // Parse optional column list
+        let columns = if self.current_token == Token::LParen {
+            self.next_token();
+            let mut cols = Vec::new();
+            loop {
+                if let Token::Identifier(col) = &self.current_token {
+                    cols.push(col.clone());
+                    self.next_token();
+                } else {
+                    return Err("Expected column name".to_string());
+                }
+                if !self.consume_if(&Token::Comma) {
+                    break;
+                }
+            }
+            self.expect(Token::RParen)?;
+            Some(cols)
+        } else {
+            None
+        };
+
+        // Parse [VALUES] or [SELECT]
+        let values = if self.consume_if(&Token::Values) {
+            let mut value_lists = Vec::new();
+            loop {
+                self.expect(Token::LParen)?;
+                let mut values = Vec::new();
+                loop {
+                    values.push(self.parse_expression()?);
+                    if !self.consume_if(&Token::Comma) {
+                        break;
+                    }
+                }
+                self.expect(Token::RParen)?;
+                value_lists.push(values);
+
+                if !self.consume_if(&Token::Comma) {
+                    break;
+                }
+            }
+            Values::Values(value_lists)
+        } else if self.current_token == Token::Select {
+            Values::Query(Box::new(self.visit_select_statement()?))
+        } else {
+            return Err("Expected VALUES or SELECT".to_string());
+        };
+
+        Ok(InsertStatement {
+            table,
+            columns,
+            values,
+        })
+    }
+
+    /// Parses transaction-management statements.
+    ///
+    /// ```sql
+    /// BEGIN / BEGIN TRANSACTION.
+    /// COMMIT
+    /// ROLLBACK
+    /// END TRANSACTION
+    /// ```
+    fn visit_transaction_statement(&mut self) -> Result<TransactionStatement, String> {
+        match &self.current_token {
+            Token::Begin => {
+                self.next_token();
+                self.consume_if(&Token::Transaction);
+                Ok(TransactionStatement::Begin)
+            }
+            Token::Commit => {
+                self.next_token();
+                Ok(TransactionStatement::Commit)
+            }
+            Token::Rollback => {
+                self.next_token();
+                Ok(TransactionStatement::Rollback)
+            }
+            _ => Err("Expected BEGIN, COMMIT, or ROLLBACK".to_string()),
+        }
+    }
+
+    /// Parses an UPDATE statement, with multiple set and where clauses.
+    ///
+    /// ```sql
+    /// UPDATE [table]
+    /// SET [col] = value
+    /// WHERE [expr]
+    /// [...]
+    /// ```
+    fn visit_update_statement(&mut self) -> Result<UpdateStatement, String> {
+        self.expect(Token::Update)?;
+
+        let table = if let Token::Identifier(name) = &self.current_token {
+            let table_name = name.clone();
+            self.next_token();
+            table_name
+        } else {
+            return Err("Expected table name".to_string());
+        };
+
+        self.expect(Token::Set)?;
+
+        let mut set_clauses = Vec::new();
+        loop {
+            if let Token::Identifier(col) = &self.current_token {
+                let column = col.clone();
+                self.next_token();
+                self.expect(Token::Eq)?;
+                let value = self.parse_expression()?;
+                set_clauses.push(SetClause { column, value });
+            } else {
+                return Err("Expected column name".to_string());
+            }
+
+            if !self.consume_if(&Token::Comma) {
+                break;
+            }
+        }
+
+        let where_clause = if self.consume_if(&Token::Where) {
+            Some(self.parse_expression()?)
+        } else {
+            None
+        };
+
+        Ok(UpdateStatement {
+            table,
+            set_clauses,
+            where_clause,
+        })
+    }
+
+    /// Parses a WITH statement, with an optional RECURSIVE clause.
+    /// ```sql
+    /// WITH
+    /// [RECURSIVE]
+    /// ALIAS AS
+    /// ([CTE])
+    ///[...] (Supports up to N ctes)
+    /// SELECT [...]
+    fn visit_with_statement(&mut self) -> Result<WithStatement, String> {
+        self.expect(Token::With)?;
+        let recursive = if matches!(self.current_token, Token::Recursive) {
+            self.next_token();
+            true
+        } else {
+            false
+        };
+
+        let mut ctes = Vec::new();
+
+        loop {
+            let name = if let Token::Identifier(id) = &self.current_token {
+                let id = id.clone();
+                self.next_token();
+                id
+            } else {
+                return Err("Expected CTE name".to_string());
+            };
+
+            self.expect(Token::As)?;
+            self.expect(Token::LParen)?;
+            let select_stmt = self.visit_select_statement()?;
+            self.expect(Token::RParen)?;
+
+            ctes.push((name, select_stmt));
+
+            if !self.consume_if(&Token::Comma) {
+                break;
+            }
+        }
+
+        let body = Box::new(self.visit_select_statement()?);
+
+        Ok(WithStatement {
+            recursive,
+            ctes,
+            body,
+        })
+    }
+
+    /// PARSES SELECT STATEMENTS
+    /// ```sql
+    /// SELECT [Projection]
+    /// FROM [Table Reference]
+    /// WHERE [Cond]
+    /// GROUP BY [Expr]
+    /// HAVING [Cond]
+    /// ORDER BY [item] [ASC/DESC]
+    /// LIMIT n;
+    /// ```
+    fn visit_select_statement(&mut self) -> Result<SelectStatement, String> {
         self.expect(Token::Select)?;
 
         let distinct = self.consume_if(&Token::Distinct);
 
         // Parse SELECT list
-        let columns = self.parse_select_list()?;
+        let columns = self.visit_select_list()?;
 
         // Parse FROM clause
         let from = if self.consume_if(&Token::From) {
-            Some(self.parse_table_reference()?)
+            Some(self.visit_table_ref()?)
         } else {
             None
         };
@@ -520,9 +1188,10 @@ impl Parser {
             limit,
         })
     }
+}
 
-    /// Parses a list of columns, which can include an star token, for a selec statement.
-    fn parse_select_list(&mut self) -> Result<Vec<SelectItem>, String> {
+impl ItemVisitor for Parser {
+    fn visit_select_list(&mut self) -> Result<Vec<SelectItem>, String> {
         let mut items = Vec::new();
 
         loop {
@@ -573,8 +1242,7 @@ impl Parser {
     /// [...]
     /// JOIN tablen ON .[..]
     /// ```
-    fn parse_table_reference(&mut self) -> Result<TableReference, String> {
-        // Start with a base table
+    fn visit_table_ref(&mut self) -> Result<TableReference, String> {
         let mut table_ref = match &self.current_token {
             Token::Identifier(name) => {
                 let table_name = name.clone();
@@ -594,8 +1262,13 @@ impl Parser {
             Token::LParen => {
                 // Subquery in FROM
                 self.next_token();
-                let subquery = self.parse_select_statement()?;
+                let subquery = self.visit_select_statement()?;
                 self.expect(Token::RParen)?;
+
+                if let Token::As = &self.current_token {
+                    self.next_token();
+                };
+
                 // Optional alias required for subquery
                 let alias = if let Token::Identifier(alias_name) = &self.current_token {
                     let alias_name = alias_name.clone();
@@ -653,7 +1326,7 @@ impl Parser {
             };
 
             // Parse the right-hand side of the join
-            let right = self.parse_table_reference()?;
+            let right = self.visit_table_ref()?;
 
             // Optional ON clause
             let on = if self.consume_if(&Token::On) {
@@ -673,260 +1346,10 @@ impl Parser {
         Ok(table_ref)
     }
 
-    pub fn parse(&mut self) -> Result<Statement, String> {
-        match &self.current_token {
-            Token::With => Ok(Statement::With(self.parse_with_statement()?)),
-            Token::Select => Ok(Statement::Select(self.parse_select_statement()?)),
-            Token::Insert => Ok(Statement::Insert(self.parse_insert_statement()?)),
-            Token::Update => Ok(Statement::Update(self.parse_update_statement()?)),
-            Token::Delete => Ok(Statement::Delete(self.parse_delete_statement()?)),
-            Token::Create => self.parse_create_statement(),
-            Token::Alter => Ok(Statement::AlterTable(self.parse_alter_table_statement()?)),
-            Token::Drop => Ok(Statement::DropTable(self.parse_drop_table_statement()?)),
-            Token::Begin | Token::Commit | Token::Rollback => {
-                Ok(Statement::Transaction(self.parse_transaction_statement()?))
-            }
-            _ => Err(format!(
-                "Unexpected statement type: {:?}",
-                self.current_token
-            )),
-        }
-    }
-
-    fn parse_with_statement(&mut self) -> Result<WithStatement, String> {
-        self.expect(Token::With)?;
-
-        let mut ctes = Vec::new();
-
-        loop {
-            let name = if let Token::Identifier(id) = &self.current_token {
-                let id = id.clone();
-                self.next_token();
-                id
-            } else {
-                return Err("Expected CTE name".to_string());
-            };
-
-            self.expect(Token::As)?;
-            self.expect(Token::LParen)?;
-            let select_stmt = self.parse_select_statement()?;
-            self.expect(Token::RParen)?;
-
-            ctes.push((name, select_stmt));
-
-            if !self.consume_if(&Token::Comma) {
-                break;
-            }
-        }
-
-        let body = Box::new(self.parse_select_statement()?);
-
-        Ok(WithStatement { ctes, body })
-    }
-
-    fn parse_insert_statement(&mut self) -> Result<InsertStatement, String> {
-        self.expect(Token::Insert)?;
-        self.expect(Token::Into)?;
-
-        let table = if let Token::Identifier(name) = &self.current_token {
-            let table_name = name.clone();
-            self.next_token();
-            table_name
-        } else {
-            return Err("Expected table name".to_string());
-        };
-
-        // Parse optional column list
-        let columns = if self.current_token == Token::LParen {
-            self.next_token();
-            let mut cols = Vec::new();
-            loop {
-                if let Token::Identifier(col) = &self.current_token {
-                    cols.push(col.clone());
-                    self.next_token();
-                } else {
-                    return Err("Expected column name".to_string());
-                }
-                if !self.consume_if(&Token::Comma) {
-                    break;
-                }
-            }
-            self.expect(Token::RParen)?;
-            Some(cols)
-        } else {
-            None
-        };
-
-        // Parse VALUES or SELECT
-        let values = if self.consume_if(&Token::Values) {
-            let mut value_lists = Vec::new();
-            loop {
-                self.expect(Token::LParen)?;
-                let mut values = Vec::new();
-                loop {
-                    values.push(self.parse_expression()?);
-                    if !self.consume_if(&Token::Comma) {
-                        break;
-                    }
-                }
-                self.expect(Token::RParen)?;
-                value_lists.push(values);
-
-                if !self.consume_if(&Token::Comma) {
-                    break;
-                }
-            }
-            Values::Values(value_lists)
-        } else if self.current_token == Token::Select {
-            Values::Query(Box::new(self.parse_select_statement()?))
-        } else {
-            return Err("Expected VALUES or SELECT".to_string());
-        };
-
-        Ok(InsertStatement {
-            table,
-            columns,
-            values,
-        })
-    }
-
-    fn parse_update_statement(&mut self) -> Result<UpdateStatement, String> {
-        self.expect(Token::Update)?;
-
-        let table = if let Token::Identifier(name) = &self.current_token {
-            let table_name = name.clone();
-            self.next_token();
-            table_name
-        } else {
-            return Err("Expected table name".to_string());
-        };
-
-        self.expect(Token::Set)?;
-
-        let mut set_clauses = Vec::new();
-        loop {
-            if let Token::Identifier(col) = &self.current_token {
-                let column = col.clone();
-                self.next_token();
-                self.expect(Token::Eq)?;
-                let value = self.parse_expression()?;
-                set_clauses.push(SetClause { column, value });
-            } else {
-                return Err("Expected column name".to_string());
-            }
-
-            if !self.consume_if(&Token::Comma) {
-                break;
-            }
-        }
-
-        let where_clause = if self.consume_if(&Token::Where) {
-            Some(self.parse_expression()?)
-        } else {
-            None
-        };
-
-        Ok(UpdateStatement {
-            table,
-            set_clauses,
-            where_clause,
-        })
-    }
-
-    fn parse_delete_statement(&mut self) -> Result<DeleteStatement, String> {
-        self.expect(Token::Delete)?;
-        self.expect(Token::From)?;
-
-        let table = if let Token::Identifier(name) = &self.current_token {
-            let table_name = name.clone();
-            self.next_token();
-            table_name
-        } else {
-            return Err("Expected table name".to_string());
-        };
-
-        let where_clause = if self.consume_if(&Token::Where) {
-            Some(self.parse_expression()?)
-        } else {
-            None
-        };
-
-        Ok(DeleteStatement {
-            table,
-            where_clause,
-        })
-    }
-
-    fn parse_create_statement(&mut self) -> Result<Statement, String> {
-        self.expect(Token::Create)?;
-
-        if self.consume_if(&Token::Table) {
-            Ok(Statement::CreateTable(self.parse_create_table_body()?))
-        } else if self.consume_if(&Token::Index) || self.consume_if(&Token::Unique) {
-            let unique = self.current_token == Token::Unique;
-            if unique {
-                self.next_token();
-                self.consume_if(&Token::Index);
-            }
-            Ok(Statement::CreateIndex(
-                self.parse_create_index_body(unique)?,
-            ))
-        } else {
-            Err("Expected TABLE or INDEX after CREATE".to_string())
-        }
-    }
-
-    fn parse_create_table_body(&mut self) -> Result<CreateTableStatement, String> {
-        let table = if let Token::Identifier(name) = &self.current_token {
-            let table_name = name.clone();
-            self.next_token();
-            table_name
-        } else {
-            return Err("Expected table name".to_string());
-        };
-
-        self.expect(Token::LParen)?;
-
-        let mut columns = Vec::new();
-        let mut constraints = Vec::new();
-
-        loop {
-            // Check if it's a table constraint
-            if matches!(
-                self.current_token,
-                Token::Primary | Token::Unique | Token::Foreign | Token::Check | Token::Constraint
-            ) {
-                constraints.push(self.parse_table_constraint()?);
-            } else if let Token::Identifier(name) = &self.current_token {
-                let col_name = name.clone();
-                self.next_token();
-                let data_type = self.parse_data_type()?;
-                let col_constraints = self.parse_column_constraints()?;
-
-                columns.push(ColumnDef {
-                    name: col_name,
-                    data_type,
-                    constraints: col_constraints,
-                });
-            } else {
-                return Err("Expected column definition or constraint".to_string());
-            }
-
-            if !self.consume_if(&Token::Comma) {
-                break;
-            }
-        }
-
-        self.expect(Token::RParen)?;
-
-        Ok(CreateTableStatement {
-            table,
-            columns,
-            constraints,
-        })
-    }
-
-    fn parse_data_type(&mut self) -> Result<DataType, String> {
+    /// Parses data types.
+    ///
+    /// Supports both SQL standard data types and RQLite specific types (VARINT, BLOB and TEXT).
+    fn visit_data_type(&mut self) -> Result<DataType, String> {
         let data_type = if let Token::Identifier(type_name) = &self.current_token {
             let name = type_name.to_uppercase();
             self.next_token();
@@ -965,12 +1388,10 @@ impl Parser {
                         } else {
                             DataType::Numeric(precision, scale)
                         }
+                    } else if name == "DECIMAL" {
+                        DataType::Decimal(None, None)
                     } else {
-                        if name == "DECIMAL" {
-                            DataType::Decimal(None, None)
-                        } else {
-                            DataType::Numeric(None, None)
-                        }
+                        DataType::Numeric(None, None)
                     }
                 }
                 "REAL" | "FLOAT" => DataType::Real,
@@ -1014,6 +1435,8 @@ impl Parser {
                 "TIME" => DataType::Time,
                 "TIMESTAMP" => DataType::Timestamp,
                 "BOOLEAN" | "BOOL" => DataType::Boolean,
+                "VARINT" => DataType::VarInt,
+                "BLOB" => DataType::Blob,
                 "JSON" => DataType::Json,
                 "JSONB" => DataType::Jsonb,
                 "UUID" => DataType::Uuid,
@@ -1026,7 +1449,37 @@ impl Parser {
         Ok(data_type)
     }
 
-    fn parse_column_constraints(&mut self) -> Result<Vec<ColumnConstraint>, String> {
+    /// Parses a column definition statement.
+    /// [COL_NAME] [DATA TYPE] [CONSTRAINTS]
+    fn visit_column_def(&mut self) -> Result<ColumnDef, String> {
+        let name = if let Token::Identifier(col_name) = &self.current_token {
+            let name = col_name.clone();
+            self.next_token();
+            name
+        } else {
+            return Err("Expected column name".to_string());
+        };
+
+        let data_type = self.visit_data_type()?;
+        let constraints = self.visit_column_constraints()?;
+
+        Ok(ColumnDef {
+            name,
+            data_type,
+            constraints,
+        })
+    }
+
+    /// Parses all types of column constraints.
+    ///
+    /// Supported types include:
+    ///
+    /// - Not Constraints,
+    /// - Unique Constraints,
+    /// - Primary and Foriegn Keys,
+    /// - Check Constraints,
+    /// - Default Constraints.
+    fn visit_column_constraints(&mut self) -> Result<Vec<ColumnConstraint>, String> {
         let mut constraints = Vec::new();
 
         loop {
@@ -1094,12 +1547,18 @@ impl Parser {
         Ok(constraints)
     }
 
-    fn parse_table_constraint(&mut self) -> Result<TableConstraint, String> {
+    /// Parses constraints applied at table level.
+    /// Ex:
+    ///
+    /// ```sql
+    /// ALTER TABLE foo ADD CONSTRAINT [body];
+    /// ```
+    fn visit_table_constraint(&mut self) -> Result<TableConstraint, String> {
         // Skip optional CONSTRAINT name
-        if self.consume_if(&Token::Constraint) {
-            if let Token::Identifier(_) = self.current_token {
-                self.next_token();
-            }
+        if self.consume_if(&Token::Constraint)
+            && let Token::Identifier(_) = self.current_token
+        {
+            self.next_token();
         }
 
         match &self.current_token {
@@ -1155,244 +1614,6 @@ impl Parser {
                 "Unexpected constraint type: {:?}",
                 self.current_token
             )),
-        }
-    }
-
-    fn parse_identifier_list(&mut self) -> Result<Vec<String>, String> {
-        let mut identifiers = Vec::new();
-
-        loop {
-            if let Token::Identifier(name) = &self.current_token {
-                identifiers.push(name.clone());
-                self.next_token();
-            } else {
-                return Err("Expected identifier".to_string());
-            }
-
-            if !self.consume_if(&Token::Comma) {
-                break;
-            }
-        }
-
-        Ok(identifiers)
-    }
-
-    fn parse_create_index_body(&mut self, unique: bool) -> Result<CreateIndexStatement, String> {
-        let if_not_exists = if self.current_token == Token::Identifier("if".to_string()) {
-            self.next_token();
-            self.expect(Token::Not)?;
-            self.expect(Token::Identifier("exists".to_string()))?;
-            true
-        } else {
-            false
-        };
-
-        let name = if let Token::Identifier(idx_name) = &self.current_token {
-            let index_name = idx_name.clone();
-            self.next_token();
-            index_name
-        } else {
-            return Err("Expected index name".to_string());
-        };
-
-        self.expect(Token::On)?;
-
-        let table = if let Token::Identifier(tbl_name) = &self.current_token {
-            let table_name = tbl_name.clone();
-            self.next_token();
-            table_name
-        } else {
-            return Err("Expected table name".to_string());
-        };
-
-        self.expect(Token::LParen)?;
-
-        let mut columns = Vec::new();
-        loop {
-            if let Token::Identifier(col_name) = &self.current_token {
-                let name = col_name.clone();
-                self.next_token();
-
-                let order = if self.consume_if(&Token::Asc) {
-                    Some(OrderDirection::Asc)
-                } else if self.consume_if(&Token::Desc) {
-                    Some(OrderDirection::Desc)
-                } else {
-                    None
-                };
-
-                columns.push(IndexColumn { name, order });
-            } else {
-                return Err("Expected column name".to_string());
-            }
-
-            if !self.consume_if(&Token::Comma) {
-                break;
-            }
-        }
-
-        self.expect(Token::RParen)?;
-
-        Ok(CreateIndexStatement {
-            name,
-            table,
-            columns,
-            unique,
-            if_not_exists,
-        })
-    }
-
-    fn parse_alter_table_statement(&mut self) -> Result<AlterTableStatement, String> {
-        self.expect(Token::Alter)?;
-        self.expect(Token::Table)?;
-
-        let table = if let Token::Identifier(name) = &self.current_token {
-            let table_name = name.clone();
-            self.next_token();
-            table_name
-        } else {
-            return Err("Expected table name".to_string());
-        };
-
-        let action = if self.consume_if(&Token::Add) {
-            if self.consume_if(&Token::Column) || matches!(self.current_token, Token::Identifier(_))
-            {
-                // Add column
-                let column_def = self.parse_column_definition()?;
-                AlterAction::AddColumn(column_def)
-            } else if self.consume_if(&Token::Constraint) {
-                // Add constraint
-                let constraint = self.parse_table_constraint()?;
-                AlterAction::AddConstraint(constraint)
-            } else {
-                return Err("Expected COLUMN or CONSTRAINT after ADD".to_string());
-            }
-        } else if self.consume_if(&Token::Drop) {
-            if self.consume_if(&Token::Column) {
-                if let Token::Identifier(col_name) = &self.current_token {
-                    let name = col_name.clone();
-                    self.next_token();
-                    AlterAction::DropColumn(name)
-                } else {
-                    return Err("Expected column name".to_string());
-                }
-            } else if self.consume_if(&Token::Constraint) {
-                if let Token::Identifier(constraint_name) = &self.current_token {
-                    let name = constraint_name.clone();
-                    self.next_token();
-                    AlterAction::DropConstraint(name)
-                } else {
-                    return Err("Expected constraint name".to_string());
-                }
-            } else {
-                return Err("Expected COLUMN or CONSTRAINT after DROP".to_string());
-            }
-        } else if self.consume_if(&Token::Alter) || self.consume_if(&Token::Modify) {
-            self.consume_if(&Token::Column);
-            if let Token::Identifier(col_name) = &self.current_token {
-                let name = col_name.clone();
-                self.next_token();
-
-                let action = if self.consume_if(&Token::Set) {
-                    if self.consume_if(&Token::Default) {
-                        let expr = self.parse_expression()?;
-                        AlterColumnAction::SetDefault(expr)
-                    } else if self.consume_if(&Token::Not) {
-                        self.expect(Token::Null)?;
-                        AlterColumnAction::SetNotNull
-                    } else {
-                        return Err("Expected DEFAULT or NOT NULL after SET".to_string());
-                    }
-                } else if self.consume_if(&Token::Drop) {
-                    if self.consume_if(&Token::Default) {
-                        AlterColumnAction::DropDefault
-                    } else if self.consume_if(&Token::Not) {
-                        self.expect(Token::Null)?;
-                        AlterColumnAction::DropNotNull
-                    } else {
-                        return Err("Expected DEFAULT or NOT NULL after DROP".to_string());
-                    }
-                } else {
-                    // Assume it's a type change
-                    let data_type = self.parse_data_type()?;
-                    AlterColumnAction::SetDataType(data_type)
-                };
-
-                AlterAction::AlterColumn { name, action }
-            } else {
-                return Err("Expected column name".to_string());
-            }
-        } else {
-            return Err("Expected ADD, DROP, ALTER, or MODIFY".to_string());
-        };
-
-        Ok(AlterTableStatement { table, action })
-    }
-
-    fn parse_column_definition(&mut self) -> Result<ColumnDef, String> {
-        let name = if let Token::Identifier(col_name) = &self.current_token {
-            let name = col_name.clone();
-            self.next_token();
-            name
-        } else {
-            return Err("Expected column name".to_string());
-        };
-
-        let data_type = self.parse_data_type()?;
-        let constraints = self.parse_column_constraints()?;
-
-        Ok(ColumnDef {
-            name,
-            data_type,
-            constraints,
-        })
-    }
-
-    fn parse_drop_table_statement(&mut self) -> Result<DropTableStatement, String> {
-        self.expect(Token::Drop)?;
-        self.expect(Token::Table)?;
-
-        let if_exists = if self.current_token == Token::Identifier("if".to_string()) {
-            self.next_token();
-            self.expect(Token::Exists)?;
-            true
-        } else {
-            false
-        };
-
-        let table = if let Token::Identifier(name) = &self.current_token {
-            let table_name = name.clone();
-            self.next_token();
-            table_name
-        } else {
-            return Err("Expected table name".to_string());
-        };
-
-        let cascade = self.consume_if(&Token::Identifier("cascade".to_string()));
-
-        Ok(DropTableStatement {
-            table,
-            if_exists,
-            cascade,
-        })
-    }
-
-    fn parse_transaction_statement(&mut self) -> Result<TransactionStatement, String> {
-        match &self.current_token {
-            Token::Begin => {
-                self.next_token();
-                self.consume_if(&Token::Transaction);
-                Ok(TransactionStatement::Begin)
-            }
-            Token::Commit => {
-                self.next_token();
-                Ok(TransactionStatement::Commit)
-            }
-            Token::Rollback => {
-                self.next_token();
-                Ok(TransactionStatement::Rollback)
-            }
-            _ => Err("Expected BEGIN, COMMIT, or ROLLBACK".to_string()),
         }
     }
 }
